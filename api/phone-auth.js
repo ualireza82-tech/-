@@ -25,8 +25,20 @@ const TelegramBot = require('node-telegram-bot-api');
 // دارد. برای دیپلوی چند-اینستنسی (چند سرور) باید این Map به Redis منتقل
 // شود؛ اما برای یک اینستنس Node.js (حالت فعلی پروژه) کاملاً کافی است.
 // ----------------------------------------------------------------------
-const sessions = new Map(); // sessionToken -> { phone, createdAt, chatId? }
+const sessions = new Map(); // sessionToken -> { phone, createdAt, chatId?, result? }
 const SESSION_TTL_MS = 10 * 60 * 1000;
+// 🔧 مدت نگه‌داریِ «نتیجه‌ی» یک جلسه‌ی تمام‌شده (موفق یا ناموفق) پس از اتمام،
+// پیش از حذف قطعی. دلیل وجودش: اگر مرورگر کاربر هنگام دریافت رویداد سوکت
+// در پس‌زمینه بوده باشد (مثلاً چون کاربر داخل اپ تلگرام است)، ممکن است اتصال
+// Socket.io قطع/از روم خارج شده باشد و رویداد emit شده هرگز به او نرسد. با
+// نگه‌داشتن نتیجه برای چند دقیقه، endpoint استعلام وضعیت (status) می‌تواند
+// وقتی کاربر به سایت برمی‌گردد، نتیجه را مستقیم و قابل‌اتکا برگرداند —
+// مستقل از این‌که رویداد لحظه‌ای سوکت رسیده باشد یا نه.
+const RESULT_RETENTION_MS = 3 * 60 * 1000;
+
+function scheduleSessionCleanup(token, delayMs) {
+  setTimeout(() => { sessions.delete(token); }, delayMs).unref?.();
+}
 
 function makeToken() {
   return 'req_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
@@ -140,10 +152,20 @@ function initPhoneAuth({ app, io, pool }) {
 
   bot.on('contact', async (msg) => {
     const chatId = msg.chat.id;
-    // پیدا کردن جلسه‌ی مرتبط با این chatId
+    // 🔧 رفع باگِ «مقایسه با جلسه‌ی کهنه»: اگر کاربر بیش از یک‌بار تلاش کرده
+    // باشد (مثلاً تلاش اول ناموفق بوده)، ممکن است چند جلسه با همین chatId
+    // در حافظه باقی مانده باشند. باید همیشه *جدیدترین* جلسه‌ی هنوز-درجریان
+    // (بیشترین createdAt در میان جلسه‌های بدون result) انتخاب شود، نه اولین
+    // موردی که در ترتیب درج به آن برمی‌خوریم؛ وگرنه تلاشِ تازه‌ی کاربر با
+    // داده‌ی یک تلاشِ قدیمی و نامرتبط مقایسه می‌شود و even شماره‌ی کاملاً
+    // درست هم «عدم تطابق» نشان داده می‌شود. جلسه‌هایی که از قبل result
+    // دارند (یعنی قبلاً پردازش شده‌اند و فقط برای استعلام REST نگه داشته
+    // شده‌اند) عمداً نادیده گرفته می‌شوند تا دوباره پردازش نشوند.
     let sessionToken = null, session = null;
     for (const [token, s] of sessions) {
-      if (s.chatId === chatId) { sessionToken = token; session = s; break; }
+      if (s.chatId === chatId && !s.result && (!session || s.createdAt > session.createdAt)) {
+        sessionToken = token; session = s;
+      }
     }
     const lang = (session && session.lang === 'fa') ? MSG.fa : tFor(msg.from && msg.from.language_code);
     if (!session) {
@@ -156,6 +178,13 @@ function initPhoneAuth({ app, io, pool }) {
     // می‌شود؛ contact.user_id باید با فرستنده پیام یکی باشد.
     if (!msg.contact || msg.contact.user_id !== msg.from.id) {
       bot.sendMessage(chatId, lang.mismatch);
+      // 🔧 به‌جای حذف فوری، نتیجه را روی جلسه ثبت می‌کنیم (برای استعلام
+      // وضعیت از REST) و حذف قطعی را چند دقیقه به تعویق می‌اندازیم. به لطفِ
+      // اصلاح انتخاب «جدیدترین جلسه» در بالا، این تأخیر باعث آلودگیِ تلاش
+      // بعدیِ کاربر نمی‌شود.
+      session.result = { ok: false, message: 'mismatch' };
+      io.to(sessionToken).emit('phone_auth:error', { message: 'mismatch' });
+      scheduleSessionCleanup(sessionToken, RESULT_RETENTION_MS);
       return;
     }
 
@@ -164,7 +193,12 @@ function initPhoneAuth({ app, io, pool }) {
 
     if (!telegramPhone || telegramPhone !== sitePhone) {
       bot.sendMessage(chatId, lang.mismatch);
+      session.result = { ok: false, message: 'mismatch' };
       io.to(sessionToken).emit('phone_auth:error', { message: 'mismatch' });
+      // 🔧 پاک‌سازی با تأخیر (نه فوری): تا endpoint استعلام وضعیت بتواند
+      // این نتیجه را حتی اگر رویداد سوکت گم شده باشد برگرداند. به لطفِ
+      // اصلاح «انتخاب جدیدترین جلسه»، این تأخیر تلاش بعدی را آلوده نمی‌کند.
+      scheduleSessionCleanup(sessionToken, RESULT_RETENTION_MS);
       return;
     }
 
@@ -179,25 +213,26 @@ function initPhoneAuth({ app, io, pool }) {
       if (existing.rows.length > 0) {
         const u = existing.rows[0];
         await pool.query("UPDATE users SET is_phone_verified = true WHERE id = $1", [u.id]);
-        io.to(sessionToken).emit('phone_auth:success', {
-          is_new_user: false,
-          phone_number: sitePhone,
-          user: u,
-        });
+        const payload = { is_new_user: false, phone_number: sitePhone, user: u };
+        session.result = { ok: true, ...payload };
+        io.to(sessionToken).emit('phone_auth:success', payload);
       } else {
         // کاربر جدید یا کاربر ایمیلیِ موجود که می‌خواهد شماره اضافه کند —
         // تصمیم نهایی (ساخت اکانت تازه یا لینک کردن به اکانت فعلی) روی
         // فرانت‌اند/endpoint تکمیل پروفایل گذاشته می‌شود.
-        io.to(sessionToken).emit('phone_auth:success', {
-          is_new_user: true,
-          phone_number: sitePhone,
-        });
+        const payload = { is_new_user: true, phone_number: sitePhone };
+        session.result = { ok: true, ...payload };
+        io.to(sessionToken).emit('phone_auth:success', payload);
       }
     } catch (e) {
       console.error('phone-auth contact handler error:', e);
+      session.result = { ok: false, message: 'server_error' };
       io.to(sessionToken).emit('phone_auth:error', { message: 'server_error' });
     } finally {
-      sessions.delete(sessionToken);
+      // 🔧 حذف با تأخیر (نه فوری): تا endpoint استعلام وضعیت بتواند نتیجه
+      // را حتی اگر رویداد سوکت به‌خاطر قطعیِ موقتِ اتصال (پس‌زمینه رفتن
+      // مرورگر هنگام بودن کاربر در اپ تلگرام) گم شده باشد، برگرداند.
+      scheduleSessionCleanup(sessionToken, RESULT_RETENTION_MS);
     }
   });
 
@@ -208,6 +243,32 @@ function initPhoneAuth({ app, io, pool }) {
     socket.on('phone_auth:join', (sessionToken) => {
       if (sessionToken && sessions.has(sessionToken)) socket.join(sessionToken);
     });
+  });
+
+  // ---- 3.۵) REST: استعلام وضعیت جلسه (راه‌حل قطعیِ گم‌شدنِ رویداد سوکت) ----
+  // وقتی مرورگر کاربر به دلیل رفتن به اپ تلگرام در پس‌زمینه قرار می‌گیرد،
+  // ممکن است اتصال Socket.io موقتاً قطع شود و رویدادِ emit‌شده‌ی سرور
+  // (phone_auth:success/error) هرگز به او نرسد — چون در لحظه‌ی ارسال، هیچ
+  // سوکتی در روم مربوطه حضور نداشته. این endpoint به فرانت‌اند اجازه می‌دهد
+  // با بازگشت به سایت (visibilitychange)، مستقیماً و بدون وابستگی به سوکت،
+  // وضعیت واقعی جلسه را از حافظه‌ی سرور بپرسد.
+  app.get('/api/auth/phone/status/:token', (req, res) => {
+    try {
+      const { token } = req.params;
+      const session = sessions.get(token);
+      if (!session) {
+        // یا هرگز وجود نداشته، یا کامل شده و پنجره‌ی نگهداری‌اش تمام شده،
+        // یا منقضی شده (۱۰ دقیقه بدون فعالیت).
+        return res.json({ pending: false, expired: true });
+      }
+      if (!session.result) {
+        return res.json({ pending: true });
+      }
+      return res.json({ pending: false, ...session.result });
+    } catch (e) {
+      console.error('phone/status error:', e);
+      res.status(500).json({ error: 'خطای سرور' });
+    }
   });
 
   // ---- 4) REST: شروع جلسه‌ی تایید شماره ----
