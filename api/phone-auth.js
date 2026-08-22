@@ -40,11 +40,32 @@ function cleanupSessions() {
 }
 setInterval(cleanupSessions, 60 * 1000).unref?.();
 
-// ورودی آزاد کاربر را به فرمت E.164-بدون-پلاس نرمال می‌کند تا مقایسه
-// شماره‌ی فرم سایت با شماره‌ی دریافتی از تلگرام قابل‌اتکا باشد.
+// فقط ارقام یک رشته‌ی خام را برمی‌گرداند (بدون +، فاصله، خط تیره و...).
+function digitsOnly(raw) {
+  return raw ? String(raw).replace(/[^\d]/g, '') : '';
+}
+
+// نرمال‌سازی یک شماره‌ی بین‌المللیِ کامل و آماده (مثلاً phone_number خروجی
+// تلگرام، یا شماره‌ای که از قبل در دیتابیس با فرمت کامل ذخیره شده) به فرمت
+// فقط-رقم. صفرِ ابتدایی در این سطح بی‌معناست چون هیچ کدکشوری با صفر شروع
+// نمی‌شود، پس حذفش هم بی‌خطر است.
 function normalizePhone(raw) {
-  if (!raw) return '';
-  return String(raw).replace(/[^\d]/g, '').replace(/^0+/, '');
+  return digitsOnly(raw).replace(/^0+/, '');
+}
+
+// 🔧 نقطه‌ی اصلی رفع باگِ «عدم تطابق شماره‌ی یکسان»:
+// کدکشور و شماره‌ی محلیِ واردشده در سایت را ترکیب می‌کند. نکته‌ی حیاتی این
+// است که صفرِ ابتداییِ رایج در شماره‌های محلی (مثلاً ۰۹۱۲... در ایران) باید
+// فقط از خودِ بخش محلی و *پیش از* چسباندن به کدکشور حذف شود؛ اگر ابتدا
+// چسبانده و بعد نرمال شود (روش قبلی: normalizePhone(dialCode + phone))،
+// آن صفر به‌جای حذف، وسط شماره باقی می‌ماند (مثلاً "98" + "0912..." →
+// "980912..." به‌جای "98912...") و هرگز با شماره‌ی بین‌المللیِ برگشتی از
+// تلگرام (که هرگز صفر ابتدایی ندارد) یکی نمی‌شود — even اگر دو شماره از نظر
+// ظاهری برای کاربر کاملاً یکسان به نظر برسند.
+function composeFullPhone(dialCode, localNumber) {
+  const dial = digitsOnly(dialCode);
+  const local = digitsOnly(localNumber).replace(/^0+/, '');
+  return dial + local;
 }
 
 function initPhoneAuth({ app, io, pool }) {
@@ -197,7 +218,7 @@ function initPhoneAuth({ app, io, pool }) {
       if (!phone || !dialCode) {
         return res.status(400).json({ error: 'شماره تلفن و کد کشور الزامی است' });
       }
-      const full = normalizePhone(dialCode + phone);
+      const full = composeFullPhone(dialCode, phone);
       const sessionToken = makeToken();
       sessions.set(sessionToken, { phone: full, createdAt: Date.now(), lang: lang === 'fa' ? 'fa' : 'en' });
 
@@ -218,7 +239,7 @@ function initPhoneAuth({ app, io, pool }) {
     try {
       const { phone, dialCode } = req.body || {};
       if (!phone || !dialCode) return res.status(400).json({ error: 'شماره تلفن الزامی است' });
-      const full = normalizePhone(dialCode + phone);
+      const full = composeFullPhone(dialCode, phone);
 
       const result = await pool.query(
         "SELECT id, username, display_name, avatar_url, header_url, verification, bio, is_admin, is_phone_verified FROM users WHERE phone_number = $1",
@@ -243,7 +264,7 @@ function initPhoneAuth({ app, io, pool }) {
       if (!userId || !phone || !dialCode) {
         return res.status(400).json({ error: 'اطلاعات ناقص است' });
       }
-      const full = normalizePhone(dialCode + phone);
+      const full = composeFullPhone(dialCode, phone);
 
       const dup = await pool.query("SELECT id FROM users WHERE phone_number = $1 AND id != $2", [full, userId]);
       if (dup.rows.length > 0) {
