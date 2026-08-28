@@ -154,11 +154,18 @@ async function applyPurchaseEffect(pool, userId, item) {
 }
 
 function initWalletModule({ app, pool, io }) {
-  ensureWalletSchema(pool).catch(e => console.error('Wallet schema ensure failed (non-fatal):', e.message));
+  // این پرامیس رو نگه می‌داریم تا هر route قبل از اجرا صبر کنه جدول‌ها ساخته شده باشن —
+  // جلوگیری از race condition در لحظه‌ی cold start (اولین درخواست‌ها بعد از استارت سرور)
+  // که می‌تونست باعث خطای «no such table» بشه حتی وقتی خودِ کوئری‌ها درست بودن.
+  const schemaReady = ensureWalletSchema(pool).catch(e => {
+    console.error('Wallet schema ensure failed:', e.message);
+    throw e;
+  });
 
   // ── اتصال آدرس کیف‌پول (فقط ثبت آدرس عمومی، هیچ کلیدی رد و بدل نمی‌شود) ──
   app.post('/api/wallet/connect', async (req, res) => {
     try {
+      await schemaReady;
       const { user_id, address, chain } = req.body;
       if (!user_id || !address) return res.status(400).json({ success: false, error: 'user_id و address الزامی است' });
 
@@ -177,6 +184,7 @@ function initWalletModule({ app, pool, io }) {
   // ── نمای کامل کیف‌پول: آدرس متصل + موجودی واقعی on-chain + AJP داخلی ──
   app.get('/api/wallet/:userId', async (req, res) => {
     try {
+      await schemaReady;
       const { userId } = req.params;
 
       const [walletRow, gamRow] = await Promise.all([
@@ -224,6 +232,7 @@ function initWalletModule({ app, pool, io }) {
   // ── فروشگاه ──
   app.get('/api/wallet/shop', async (req, res) => {
     try {
+      await schemaReady;
       const items = await pool.query(`SELECT * FROM shop_items WHERE is_active = true ORDER BY id ASC`);
       res.json({ success: true, items: items.rows });
     } catch (err) {
@@ -234,6 +243,7 @@ function initWalletModule({ app, pool, io }) {
   // ── مرحله ۱ خرید: شروع سفارش ──
   app.post('/api/wallet/purchase/initiate', async (req, res) => {
     try {
+      await schemaReady;
       const { user_id, item_key, method } = req.body;
       const itemRes = await pool.query(`SELECT * FROM shop_items WHERE item_key = $1 AND is_active = true`, [item_key]);
       const item = itemRes.rows[0];
@@ -283,6 +293,7 @@ function initWalletModule({ app, pool, io }) {
   // ── مرحله ۲ خرید (فقط برای USDT): تایید on-chain با tx_hash ──
   app.post('/api/wallet/purchase/confirm', async (req, res) => {
     try {
+      await schemaReady;
       const { user_id, item_key, tx_hash } = req.body;
       if (!tx_hash) return res.status(400).json({ success: false, error: 'tx_hash الزامی است' });
 
@@ -337,6 +348,7 @@ function initWalletModule({ app, pool, io }) {
   // ── تاریخچه ──
   app.get('/api/wallet/:userId/history', async (req, res) => {
     try {
+      await schemaReady;
       const rows = await pool.query(
         `SELECT item_key, method, amount, status, created_at, confirmed_at
          FROM wallet_transactions WHERE user_id = $1 ORDER BY id DESC LIMIT 50`,
