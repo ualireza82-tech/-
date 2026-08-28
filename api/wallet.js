@@ -41,32 +41,57 @@ async function fetchLivePrices() {
   if (_priceCache.data && Date.now() - _priceCache.ts < PRICE_CACHE_TTL_MS) {
     return _priceCache.data;
   }
-  const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbols=["BTCUSDT","ETHUSDT","BNBUSDT"]');
-  const rows = await res.json();
-  const prices = { USDT: 1 };
-  for (const r of rows) {
-    prices[r.symbol.replace('USDT', '')] = parseFloat(r.price);
+  // نکته‌ی حیاتی: بایننس روی برخی زیرساخت‌های هاستینگ/ابری، محدودیت جغرافیایی
+  // (451 Restricted Location) اعمال می‌کند. قبلاً اینجا هیچ try/catch نبود؛
+  // یعنی اگر این fetch یا res.json() به هر دلیلی (مسدودیت، ریت‌لیمیت، پاسخ
+  // غیر-JSON) شکست می‌خورد، کل روت GET /api/wallet/:userId با خطای ۵۰۰
+  // متوقف می‌شد و کلاینت هرگز حتی آدرس تازه‌ذخیره‌شده را هم نمی‌دید — دقیقاً
+  // همان رفتاری که باعث می‌شد ثبت دستی «هیچ اتفاقی نیفتد».
+  try {
+    const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbols=["BTCUSDT","ETHUSDT","BNBUSDT"]');
+    if (!res.ok) throw new Error('Binance HTTP ' + res.status);
+    const rows = await res.json();
+    if (!Array.isArray(rows)) throw new Error('Binance پاسخ غیرمنتظره داد: ' + JSON.stringify(rows).slice(0, 200));
+    const prices = { USDT: 1 };
+    for (const r of rows) {
+      prices[r.symbol.replace('USDT', '')] = parseFloat(r.price);
+    }
+    _priceCache = { data: prices, ts: Date.now() };
+    return prices;
+  } catch (e) {
+    console.error('fetchLivePrices failed, falling back to cached/zero prices:', e.message);
+    // اگر کش قدیمی داریم بهتر از هیچیه؛ وگرنه حداقل USDT=1 برمی‌گردونیم تا
+    // بقیه‌ی مسیر (نمایش آدرس/وضعیت اتصال) اصلاً قطع نشه.
+    return _priceCache.data || { USDT: 1 };
   }
-  _priceCache = { data: prices, ts: Date.now() };
-  return prices;
 }
 
 async function fetchBscBalance(address, contract) {
-  const key = process.env.BSCSCAN_API_KEY || '';
-  const url = `${BSCSCAN_API}?module=account&action=tokenbalance&contractaddress=${contract}&address=${address}&tag=latest&apikey=${key}`;
-  const res = await fetch(url);
-  const data = await res.json();
-  if (data.status !== '1') return 0;
-  return Number(data.result) / 1e18;
+  try {
+    const key = process.env.BSCSCAN_API_KEY || '';
+    const url = `${BSCSCAN_API}?module=account&action=tokenbalance&contractaddress=${contract}&address=${address}&tag=latest&apikey=${key}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (data.status !== '1') return 0;
+    return Number(data.result) / 1e18;
+  } catch (e) {
+    console.error('fetchBscBalance failed for', address, e.message);
+    return 0;
+  }
 }
 
 async function fetchBnbBalance(address) {
-  const key = process.env.BSCSCAN_API_KEY || '';
-  const url = `${BSCSCAN_API}?module=account&action=balance&address=${address}&tag=latest&apikey=${key}`;
-  const res = await fetch(url);
-  const data = await res.json();
-  if (data.status !== '1') return 0;
-  return Number(data.result) / 1e18;
+  try {
+    const key = process.env.BSCSCAN_API_KEY || '';
+    const url = `${BSCSCAN_API}?module=account&action=balance&address=${address}&tag=latest&apikey=${key}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (data.status !== '1') return 0;
+    return Number(data.result) / 1e18;
+  } catch (e) {
+    console.error('fetchBnbBalance failed for', address, e.message);
+    return 0;
+  }
 }
 
 // ----------------------------------------------------------------------
@@ -154,18 +179,11 @@ async function applyPurchaseEffect(pool, userId, item) {
 }
 
 function initWalletModule({ app, pool, io }) {
-  // این پرامیس رو نگه می‌داریم تا هر route قبل از اجرا صبر کنه جدول‌ها ساخته شده باشن —
-  // جلوگیری از race condition در لحظه‌ی cold start (اولین درخواست‌ها بعد از استارت سرور)
-  // که می‌تونست باعث خطای «no such table» بشه حتی وقتی خودِ کوئری‌ها درست بودن.
-  const schemaReady = ensureWalletSchema(pool).catch(e => {
-    console.error('Wallet schema ensure failed:', e.message);
-    throw e;
-  });
+  ensureWalletSchema(pool).catch(e => console.error('Wallet schema ensure failed (non-fatal):', e.message));
 
   // ── اتصال آدرس کیف‌پول (فقط ثبت آدرس عمومی، هیچ کلیدی رد و بدل نمی‌شود) ──
   app.post('/api/wallet/connect', async (req, res) => {
     try {
-      await schemaReady;
       const { user_id, address, chain } = req.body;
       if (!user_id || !address) return res.status(400).json({ success: false, error: 'user_id و address الزامی است' });
 
@@ -184,7 +202,6 @@ function initWalletModule({ app, pool, io }) {
   // ── نمای کامل کیف‌پول: آدرس متصل + موجودی واقعی on-chain + AJP داخلی ──
   app.get('/api/wallet/:userId', async (req, res) => {
     try {
-      await schemaReady;
       const { userId } = req.params;
 
       const [walletRow, gamRow] = await Promise.all([
@@ -199,18 +216,28 @@ function initWalletModule({ app, pool, io }) {
       let totalUsd = 0;
 
       if (wallet) {
-        const prices = await fetchLivePrices();
-        const [bnb, usdt] = await Promise.all([
-          fetchBnbBalance(wallet.address),
-          fetchBscBalance(wallet.address, USDT_BEP20_CONTRACT),
-        ]);
-        const bnbUsd = bnb * (prices.BNB || 0);
-        const usdtUsd = usdt * 1;
-        totalUsd = bnbUsd + usdtUsd;
-        assets = [
-          { symbol: 'BNB', balance: bnb, usd_value: bnbUsd },
-          { symbol: 'USDT', balance: usdt, usd_value: usdtUsd },
-        ];
+        // این بلوک عمداً از بقیه‌ی روت جدا شده: هدف اینه که اگر گرفتن موجودی
+        // آنچین (بایننس/BscScan) به هر دلیلی شکست بخوره، حداقل «متصل بودن +
+        // آدرس» رو از دست ندیم — چون همون چیزیه که کاربر بلافاصله بعد از ثبت
+        // دستی منتظرشه که ببینه.
+        try {
+          const prices = await fetchLivePrices();
+          const [bnb, usdt] = await Promise.all([
+            fetchBnbBalance(wallet.address),
+            fetchBscBalance(wallet.address, USDT_BEP20_CONTRACT),
+          ]);
+          const bnbUsd = bnb * (prices.BNB || 0);
+          const usdtUsd = usdt * 1;
+          totalUsd = bnbUsd + usdtUsd;
+          assets = [
+            { symbol: 'BNB', balance: bnb, usd_value: bnbUsd },
+            { symbol: 'USDT', balance: usdt, usd_value: usdtUsd },
+          ];
+        } catch (balanceErr) {
+          console.error('wallet balance lookup failed (address still reported as connected):', balanceErr.message);
+          assets = [];
+          totalUsd = 0;
+        }
       }
 
       res.json({
@@ -232,7 +259,6 @@ function initWalletModule({ app, pool, io }) {
   // ── فروشگاه ──
   app.get('/api/wallet/shop', async (req, res) => {
     try {
-      await schemaReady;
       const items = await pool.query(`SELECT * FROM shop_items WHERE is_active = true ORDER BY id ASC`);
       res.json({ success: true, items: items.rows });
     } catch (err) {
@@ -243,7 +269,6 @@ function initWalletModule({ app, pool, io }) {
   // ── مرحله ۱ خرید: شروع سفارش ──
   app.post('/api/wallet/purchase/initiate', async (req, res) => {
     try {
-      await schemaReady;
       const { user_id, item_key, method } = req.body;
       const itemRes = await pool.query(`SELECT * FROM shop_items WHERE item_key = $1 AND is_active = true`, [item_key]);
       const item = itemRes.rows[0];
@@ -293,7 +318,6 @@ function initWalletModule({ app, pool, io }) {
   // ── مرحله ۲ خرید (فقط برای USDT): تایید on-chain با tx_hash ──
   app.post('/api/wallet/purchase/confirm', async (req, res) => {
     try {
-      await schemaReady;
       const { user_id, item_key, tx_hash } = req.body;
       if (!tx_hash) return res.status(400).json({ success: false, error: 'tx_hash الزامی است' });
 
@@ -348,7 +372,6 @@ function initWalletModule({ app, pool, io }) {
   // ── تاریخچه ──
   app.get('/api/wallet/:userId/history', async (req, res) => {
     try {
-      await schemaReady;
       const rows = await pool.query(
         `SELECT item_key, method, amount, status, created_at, confirmed_at
          FROM wallet_transactions WHERE user_id = $1 ORDER BY id DESC LIMIT 50`,
