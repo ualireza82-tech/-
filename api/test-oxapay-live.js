@@ -64,6 +64,12 @@ async function main() {
     process.exit(1);
   }
 
+  console.log(`▶ status داخلی پاکت OxaPay: ${json.status}`);
+  console.log(`▶ message: ${json.message}`);
+  if (json.error && Object.keys(json.error).length > 0) {
+    console.log('▶ ⚠️ آبجکت error پر است (یعنی درخواست رد شده):', json.error);
+  }
+
   const fields = extractOxapayFields(json);
   console.log('▶ فیلدهای استخراج‌شده توسط extractOxapayFields():');
   console.log(fields);
