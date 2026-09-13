@@ -159,18 +159,25 @@ function initPaymentsModule({ app, pool, io, cron }) {
       let oxJson;
       try { oxJson = JSON.parse(rawText); } catch { oxJson = null; }
 
-      if (!oxRes.ok || !oxJson) {
-        console.error('❌ [payments-oxapay] OxaPay white-label request failed:', oxRes.status, rawText.slice(0, 500));
-        return res.status(502).json({ error: 'خطا در ارتباط با درگاه پرداخت. لطفاً دوباره تلاش کنید.' });
+      // پاکت پاسخ رسمی v1 اوکساپی: { data, message, error: {type,key,message}|{}, status, version }
+      // status=200 یعنی موفق؛ هر چیز دیگری یا وجود error غیرخالی یعنی شکست —
+      // فقط به HTTP ok اعتماد نمی‌کنیم چون OxaPay گاهی خطای منطقی را با HTTP 200 برمی‌گرداند.
+      const oxHasError = !oxJson || (oxJson.error && Object.keys(oxJson.error).length > 0) || (oxJson.status && oxJson.status !== 200);
+      if (!oxRes.ok || oxHasError) {
+        const oxMessage = oxJson?.error?.message || oxJson?.message || rawText.slice(0, 300);
+        console.error('❌ [payments-oxapay] OxaPay white-label request failed:', oxRes.status, oxMessage);
+        return res.status(502).json({ error: `خطا در ارتباط با درگاه پرداخت: ${oxMessage}` });
       }
 
       const fields = extractOxapayFields(oxJson);
       if (!fields.trackId || !fields.address || !fields.payAmount) {
         console.error('❌ [payments-oxapay] پاسخ OxaPay فیلدهای موردنیاز را نداشت. پاسخ خام:', JSON.stringify(oxJson).slice(0, 800));
-        return res.status(502).json({ error: 'پاسخ درگاه پرداخت قابل پردازش نبود.' });
+        return res.status(502).json({ error: 'پاسخ درگاه پرداخت قابل پردازش نبود. لاگ سرور را برای جزئیات ببین.' });
       }
 
-      const expiresAt = new Date(Date.now() + INVOICE_LIFETIME_MINUTES * 60 * 1000).toISOString();
+      const expiresAt = fields.expireTime
+        ? new Date(fields.expireTime * 1000).toISOString()
+        : new Date(Date.now() + INVOICE_LIFETIME_MINUTES * 60 * 1000).toISOString();
 
       await pool.query(
         `INSERT INTO payment_invoices
@@ -188,7 +195,7 @@ function initPaymentsModule({ app, pool, io, cron }) {
         address: fields.address,
         pay_amount: fields.payAmount,
         pay_currency: coin.pay_currency,
-        expires_in_seconds: INVOICE_LIFETIME_MINUTES * 60,
+        expires_in_seconds: secondsUntil(expiresAt) || INVOICE_LIFETIME_MINUTES * 60,
       });
     } catch (error) {
       console.error('❌ [payments-oxapay] /create error:', error);
@@ -345,12 +352,20 @@ async function ensurePaymentsSchema(pool) {
 
 // استخراج نام فیلدهای پاسخ OxaPay — تنها نقطه‌ای که باید در صورت نیاز
 // اصلاح شود، اگر شکل واقعی پاسخ کمی متفاوت از این حدس‌ها بود.
+// استخراج نام فیلدهای پاسخ OxaPay — ترتیب اولویت هر فیلد بر اساس نمونه‌های
+// واقعی مستندشده در داک‌های v1 (Static Address List و Payment History)
+// انتخاب شده، نه حدس محض:
+//   • wrapper: پاسخ‌های v1 معمولا در {"data": {...}} پیچیده می‌شوند
+//   • track_id / address: دقیقا همین snake_case در نمونه‌ی Static Address List دیده شده
+//   • amount: در Payment History دقیقا با همین نام و همین معنی (مبلغ) مستند شده
+//   • expire_time: در بلاگ رسمی OxaPay به‌عنوان فیلد شمارش‌معکوس معرفی شده
 function extractOxapayFields(oxJson) {
   const d = oxJson.data || oxJson.result?.data || oxJson;
   return {
     trackId: d.track_id || d.trackId || d.trackID || null,
     address: d.address || d.pay_address || d.payAddress || null,
     payAmount: d.amount || d.pay_amount || d.payAmount || null,
+    expireTime: d.expire_time || d.expireTime || null, // یونیکس‌تایم ثانیه؛ اگر نبود از lifetime پیش‌فرض استفاده می‌شود
   };
 }
 
