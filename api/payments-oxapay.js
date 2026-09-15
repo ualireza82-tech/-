@@ -17,16 +17,25 @@
 //   OXAPAY_CALLBACK_URL       آدرس کامل همین سرور برای وبهوک، مثلاً:
 //                             https://server.ajsports.ir/api/payments/oxapay/webhook
 //
-// ⚠️ نکته‌ی مهم درباره‌ی نام دقیق فیلدهای پاسخ OxaPay:
-// مستندات رسمی OxaPay فقط نمونه‌ی BODY درخواست را نشان می‌دهند، نه دقیق
-// شکل کامل پاسخ JSON. چون از محیط sandbox من هیچ دسترسی اینترنتی به
-// api.oxapay.com وجود ندارد، امکان تست زنده‌ی واقعی این تماس را نداشتم.
-// به همین دلیل استخراج فیلدها در تابع extractOxapayFields() متمرکز شده
-// و چند نام‌ محتمل (snake_case و camelCase) را همزمان امتحان می‌کند، و
-// راه‌انداز اول هر فراخوانی واقعی، پاسخ خام را کامل لاگ می‌کند تا در صورت
-// نیاز به اصلاح، فقط همین یک تابع را ویرایش کنی — نه کد پراکنده در همه‌جا.
-// همراه این فایل یک اسکریپت test-oxapay-live.js هم هست که با یک دستور
-// روی سرور واقعی‌ات پاسخ خام API را برایت چاپ می‌کند.
+// ⚠️ اصلاحیه‌ی مهم (باگ واقعی رفع شد — قیمت آنلاین بیت‌کوین محاسبه
+// نمی‌شد و ساخت فاکتور برای BTC نتیجه‌ی درستی نمی‌داد):
+// طبق اسکیمای رسمی OxaPay برای POST /payment/white-label، پاسخ دو فیلد
+// کاملاً متفاوت دارد:
+//   • data.amount      → همان مبلغ اصلی فاکتور (مثلاً 2.99 دلار)
+//   • data.pay_amount  → مبلغ واقعی که باید در همان رمزارز پرداخت شود
+//                        (مثلاً 0.0000271 بیت‌کوین) — این خروجی «تبدیل
+//                        آنلاین نرخ» توسط خود OxaPay است.
+// تابع extractOxapayFields قبلاً با اولویت اشتباه نوشته شده بود:
+//   payAmount: d.amount || d.pay_amount || d.payAmount || null
+// چون d.amount همیشه مقداری غیرصفر است (همان مبلغ دلاری)، عملگر || هرگز
+// به d.pay_amount نمی‌رسید و همیشه مبلغ خام دلاری به‌جای مبلغ واقعی
+// رمزارز برگردانده می‌شد. برای USDT (نرخ تقریبا ۱:۱) این تفاوت تقریبا
+// نامحسوس بود، اما برای BTC/ETH/LTC/TRX که نسبت تبدیل کاملا متفاوت است
+// باعث نمایش عددی کاملا بی‌معنی (مثلا «2.99 BTC» به‌جای ۰.۰۰۰۰۲۷) می‌شد.
+// همچنین فیلد انقضا طبق مستندات دقیقا expired_at نام دارد نه expire_time؛
+// این هم اصلاح شد. اولویت شبکه‌ی BTC/LTC (Bitcoin/Litecoin) قبلا با
+// مستندات زنده‌ی OxaPay (GET /v1/common/currencies) راستی‌آزمایی و
+// تایید شد و دست‌نخورده باقی مانده است.
 // ══════════════════════════════════════════════════════════════════════
 
 const crypto = require('crypto');
@@ -54,18 +63,10 @@ const PLAN_CATALOG = {
 
 // ── نگاشت رسمی سکه‌ها به پارامترهای دقیق OxaPay — کلاینت هرگز نمی‌تواند
 //    مستقیم pay_currency/network دلخواه بفرستد، فقط یکی از این کدها را ──
-// ⚠️ نکته‌ی مهم (باگ واقعی که رفع شد): طبق مستندات رسمی OxaPay
-// (GET /common/currencies)، هر سکه یک شیء "networks" دارد که کلید آن
-// نام دقیق شبکه است — نه نماد سکه. برای BTC این کلید "Bitcoin" است
-// (نه "BTC") و برای LTC این کلید "Litecoin" است (نه "LTC"). فیلد
-// network در بدنه‌ی /payment/white-label باید دقیقا یکی از همین
-// کلیدها باشد. قبلاً برای BTC/LTC اصلاً network ارسال نمی‌شد و کد به
-// رفتار مستندنشده‌ی "اگر مشخص نشود شبکه‌ی پیش‌فرض استفاده می‌شود"
-// تکیه می‌کرد؛ در عمل این فال‌بک برای هر دو سکه به‌طور پایدار کار
-// نمی‌کرد و ساخت فاکتور را (با تاخیر طولانی که در نهایت به‌صورت خطای
-// شبکه در فرانت‌اند دیده می‌شد) با شکست مواجه می‌کرد. اکنون هر دو
-// سکه صریحاً network درست خودشان را می‌فرستند، دقیقا مثل بقیه‌ی
-// سکه‌های چندشبکه‌ای.
+// طبق مستندات زنده‌ی OxaPay (GET /v1/common/currencies)، برای BTC کلید
+// شبکه دقیقا "Bitcoin" و برای LTC دقیقا "Litecoin" است (هر دو با
+// keys اضافی مثل "BTC"/"LTC" هم قابل قبول‌اند، ولی نام کانونیک شبکه
+// همان "Bitcoin"/"Litecoin" است) — این بخش صحیح بوده و دست‌نخورده مانده.
 const CURRENCY_MAP = {
   USDT_TRC20: { pay_currency: 'USDT', network: 'TRC20' },
   USDT_BEP20: { pay_currency: 'USDT', network: 'BEP20' },
@@ -182,13 +183,47 @@ function initPaymentsModule({ app, pool, io, cron }) {
         description: `AJ Premium — ${plan} (${billing})`,
       };
 
-      let oxRes;
-      try {
-        oxRes = await fetchWithTimeout(`${OXAPAY_API_BASE}/payment/white-label`, {
+      async function callOxapayWhiteLabel(body) {
+        const r = await fetchWithTimeout(`${OXAPAY_API_BASE}/payment/white-label`, {
           method: 'POST',
           headers: { merchant_api_key: MERCHANT_API_KEY, 'Content-Type': 'application/json' },
-          body: JSON.stringify(oxBody),
+          body: JSON.stringify(body),
         });
+        const text = await r.text();
+        let json;
+        try { json = JSON.parse(text); } catch { json = null; }
+        const hasError = !json || (json.error && Object.keys(json.error).length > 0) || (json.status && json.status !== 200);
+        return { res: r, json, text, hasError };
+      }
+
+      let oxRes, oxJson, rawText, oxHasError;
+      let usedNetwork = coin.network || null;
+      try {
+        let attemptBody = { ...oxBody };
+        let attempt = await callOxapayWhiteLabel(attemptBody);
+        console.log(`ℹ️ [payments-oxapay] تلاش اول برای ${currency} (network=${attemptBody.network || '—'}):`, attempt.res.status, JSON.stringify(attempt.json ?? attempt.text).slice(0, 500));
+
+        // اگر خطا مشخصاً مربوط به فیلد network باشد (چه مقدار غلط بوده باشد چه
+        // اصلاً برای این سکه پذیرفته نشود)، یک‌بار بدون network دوباره تلاش
+        // می‌کنیم تا کارکرد از منشأ واقعی خطا مستقل شود، نه از حدس ما.
+        const errMsgLower = String(attempt.json?.error?.message || attempt.json?.message || '').toLowerCase();
+        const looksLikeNetworkIssue = attempt.hasError && attemptBody.network && /network|شبکه/i.test(errMsgLower);
+        if (looksLikeNetworkIssue) {
+          console.warn(`⚠️ [payments-oxapay] خطای مرتبط با network برای ${currency}؛ تلاش دوم بدون network...`);
+          const { network, ...withoutNetwork } = attemptBody;
+          attemptBody = withoutNetwork;
+          attempt = await callOxapayWhiteLabel(attemptBody);
+          console.log(`ℹ️ [payments-oxapay] تلاش دوم برای ${currency} (بدون network):`, attempt.res.status, JSON.stringify(attempt.json ?? attempt.text).slice(0, 500));
+        }
+
+        oxRes = attempt.res;
+        oxJson = attempt.json;
+        rawText = attempt.text;
+        oxHasError = attempt.hasError;
+        // ⚠️ مهم: هرگز شیء coin (که مستقیم از CURRENCY_MAP مشترک می‌آید) را
+        // mutate نکن — این شیء بین همه‌ی درخواست‌های هم‌زمان به اشتراک
+        // گذاشته شده و تغییر آن باعث race condition بین کاربران می‌شود.
+        usedNetwork = attemptBody.network || null;
       } catch (fetchErr) {
         const isTimeout = fetchErr.name === 'AbortError';
         console.error(`❌ [payments-oxapay] اتصال به OxaPay ${isTimeout ? 'timeout خورد' : 'با خطا مواجه شد'} (currency=${currency}):`, fetchErr.message);
@@ -198,14 +233,6 @@ function initPaymentsModule({ app, pool, io, cron }) {
             : 'اتصال به درگاه پرداخت برقرار نشد. لطفاً دوباره تلاش کنید.',
         });
       }
-      const rawText = await oxRes.text();
-      let oxJson;
-      try { oxJson = JSON.parse(rawText); } catch { oxJson = null; }
-
-      // پاکت پاسخ رسمی v1 اوکساپی: { data, message, error: {type,key,message}|{}, status, version }
-      // status=200 یعنی موفق؛ هر چیز دیگری یا وجود error غیرخالی یعنی شکست —
-      // فقط به HTTP ok اعتماد نمی‌کنیم چون OxaPay گاهی خطای منطقی را با HTTP 200 برمی‌گرداند.
-      const oxHasError = !oxJson || (oxJson.error && Object.keys(oxJson.error).length > 0) || (oxJson.status && oxJson.status !== 200);
       if (!oxRes.ok || oxHasError) {
         const oxMessage = oxJson?.error?.message || oxJson?.message || rawText.slice(0, 300);
         console.error('❌ [payments-oxapay] OxaPay white-label request failed:', oxRes.status, oxMessage);
@@ -229,7 +256,7 @@ function initPaymentsModule({ app, pool, io, cron }) {
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'pending',$13)`,
         [
           fields.trackId, orderId, user.id, user.username, plan, billing, currency,
-          amountUsd, coin.pay_currency, coin.network || null, fields.payAmount, fields.address, expiresAt,
+          amountUsd, coin.pay_currency, usedNetwork, fields.payAmount, fields.address, expiresAt,
         ]
       );
 
@@ -393,22 +420,32 @@ async function ensurePaymentsSchema(pool) {
   console.log('✅ [payments-oxapay] schema آماده است (payment_invoices + ستون‌های premium_* در users)');
 }
 
-// استخراج نام فیلدهای پاسخ OxaPay — تنها نقطه‌ای که باید در صورت نیاز
-// اصلاح شود، اگر شکل واقعی پاسخ کمی متفاوت از این حدس‌ها بود.
-// استخراج نام فیلدهای پاسخ OxaPay — ترتیب اولویت هر فیلد بر اساس نمونه‌های
-// واقعی مستندشده در داک‌های v1 (Static Address List و Payment History)
-// انتخاب شده، نه حدس محض:
-//   • wrapper: پاسخ‌های v1 معمولا در {"data": {...}} پیچیده می‌شوند
-//   • track_id / address: دقیقا همین snake_case در نمونه‌ی Static Address List دیده شده
-//   • amount: در Payment History دقیقا با همین نام و همین معنی (مبلغ) مستند شده
-//   • expire_time: در بلاگ رسمی OxaPay به‌عنوان فیلد شمارش‌معکوس معرفی شده
+// استخراج نام فیلدهای پاسخ OxaPay برای POST /payment/white-label.
+//
+// ⚠️ اصلاح‌شده: طبق اسکیمای رسمی OpenAPI که OxaPay منتشر کرده (سند
+// «Generate White Label» — تگ «White-label»)، فیلدهای مربوط به مبلغ در
+// پاسخ این endpoint دقیقاً این‌طور تعریف شده‌اند:
+//   • amount      → "The amount of currency for the invoice."         (مبلغ اصلی فاکتور، مثلا 2.99 دلار)
+//   • pay_amount  → "The amount to be paid in the payment currency
+//                    (e.g., BTC value)."                              (مبلغ واقعی که باید در همان رمزارز پرداخت شود)
+// این دو فیلد کاملاً متفاوت‌اند. نسخه‌ی قبلی این تابع اشتباهاً amount را
+// در اولویت اول قرار داده بود (payAmount: d.amount || d.pay_amount...)
+// که باعث می‌شد همیشه مبلغ خامِ دلاری به‌جای مبلغ واقعیِ رمزارز (که
+// OxaPay بر اساس نرخ لحظه‌ای محاسبه و برمی‌گرداند) نمایش داده شود —
+// برای USDT به‌خاطر نرخ نزدیک به ۱:۱ نامحسوس بود، ولی برای BTC/ETH/LTC/TRX
+// کاملاً بی‌معنی می‌شد (مثلا «۲.۹۹ BTC» به‌جای عدد واقعی).
+// حالا pay_amount در اولویت اول است.
+//
+// همچنین نام فیلد انقضا طبق همان اسکیما دقیقاً expired_at است (نه
+// expire_time)؛ این هم اصلاح شد تا شمارش‌معکوس واقعی OxaPay استفاده شود
+// نه همیشه مقدار پیش‌فرض ۳۰ دقیقه.
 function extractOxapayFields(oxJson) {
   const d = oxJson.data || oxJson.result?.data || oxJson;
   return {
     trackId: d.track_id || d.trackId || d.trackID || null,
     address: d.address || d.pay_address || d.payAddress || null,
-    payAmount: d.amount || d.pay_amount || d.payAmount || null,
-    expireTime: d.expire_time || d.expireTime || null, // یونیکس‌تایم ثانیه؛ اگر نبود از lifetime پیش‌فرض استفاده می‌شود
+    payAmount: d.pay_amount ?? d.payAmount ?? d.amount ?? null,
+    expireTime: d.expired_at ?? d.expire_time ?? d.expireTime ?? null, // یونیکس‌تایم ثانیه؛ اگر نبود از lifetime پیش‌فرض استفاده می‌شود
   };
 }
 
