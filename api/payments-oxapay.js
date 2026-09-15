@@ -54,14 +54,46 @@ const PLAN_CATALOG = {
 
 // ── نگاشت رسمی سکه‌ها به پارامترهای دقیق OxaPay — کلاینت هرگز نمی‌تواند
 //    مستقیم pay_currency/network دلخواه بفرستد، فقط یکی از این کدها را ──
+// ⚠️ نکته‌ی مهم (باگ واقعی که رفع شد): طبق مستندات رسمی OxaPay
+// (GET /common/currencies)، هر سکه یک شیء "networks" دارد که کلید آن
+// نام دقیق شبکه است — نه نماد سکه. برای BTC این کلید "Bitcoin" است
+// (نه "BTC") و برای LTC این کلید "Litecoin" است (نه "LTC"). فیلد
+// network در بدنه‌ی /payment/white-label باید دقیقا یکی از همین
+// کلیدها باشد. قبلاً برای BTC/LTC اصلاً network ارسال نمی‌شد و کد به
+// رفتار مستندنشده‌ی "اگر مشخص نشود شبکه‌ی پیش‌فرض استفاده می‌شود"
+// تکیه می‌کرد؛ در عمل این فال‌بک برای هر دو سکه به‌طور پایدار کار
+// نمی‌کرد و ساخت فاکتور را (با تاخیر طولانی که در نهایت به‌صورت خطای
+// شبکه در فرانت‌اند دیده می‌شد) با شکست مواجه می‌کرد. اکنون هر دو
+// سکه صریحاً network درست خودشان را می‌فرستند، دقیقا مثل بقیه‌ی
+// سکه‌های چندشبکه‌ای.
 const CURRENCY_MAP = {
   USDT_TRC20: { pay_currency: 'USDT', network: 'TRC20' },
   USDT_BEP20: { pay_currency: 'USDT', network: 'BEP20' },
-  BTC:        { pay_currency: 'BTC' },
+  BTC:        { pay_currency: 'BTC', network: 'Bitcoin' },
   ETH_ERC20:  { pay_currency: 'ETH', network: 'ERC20' },
   TRX_TRC20:  { pay_currency: 'TRX', network: 'TRC20' },
-  LTC:        { pay_currency: 'LTC' },
+  LTC:        { pay_currency: 'LTC', network: 'Litecoin' },
 };
+
+// درخواست به OxaPay را به یک سقف زمانی محدود می‌کند. بدون این، اگر
+// OxaPay برای یک سکه‌ی خاص کند پاسخ دهد یا اصلاً پاسخ ندهد، درخواست
+// ساخت فاکتور روی سرور ما بی‌نهایت آویزان می‌ماند تا کلاینت/مرورگر
+// خودش timeout بزند و پیام مبهم «اتصال به سرور برقرار نشد» را نشان
+// دهد — دقیقا همان رفتاری که باعث گزارش این باگ شد.
+const OXAPAY_REQUEST_TIMEOUT_MS = 20000;
+// روی نسخه‌های خیلی قدیمی Node ممکن است AbortController سراسری نباشد؛
+// در آن صورت به‌جای کرش کردن، بدون timeout (رفتار قبلی) ادامه می‌دهیم.
+const AbortControllerImpl = typeof AbortController !== 'undefined' ? AbortController : null;
+async function fetchWithTimeout(url, options) {
+  if (!AbortControllerImpl) return fetch(url, options);
+  const controller = new AbortControllerImpl();
+  const timer = setTimeout(() => controller.abort(), OXAPAY_REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function initPaymentsModule({ app, pool, io, cron }) {
   const MERCHANT_API_KEY = process.env.OXAPAY_MERCHANT_API_KEY;
@@ -150,11 +182,22 @@ function initPaymentsModule({ app, pool, io, cron }) {
         description: `AJ Premium — ${plan} (${billing})`,
       };
 
-      const oxRes = await fetch(`${OXAPAY_API_BASE}/payment/white-label`, {
-        method: 'POST',
-        headers: { merchant_api_key: MERCHANT_API_KEY, 'Content-Type': 'application/json' },
-        body: JSON.stringify(oxBody),
-      });
+      let oxRes;
+      try {
+        oxRes = await fetchWithTimeout(`${OXAPAY_API_BASE}/payment/white-label`, {
+          method: 'POST',
+          headers: { merchant_api_key: MERCHANT_API_KEY, 'Content-Type': 'application/json' },
+          body: JSON.stringify(oxBody),
+        });
+      } catch (fetchErr) {
+        const isTimeout = fetchErr.name === 'AbortError';
+        console.error(`❌ [payments-oxapay] اتصال به OxaPay ${isTimeout ? 'timeout خورد' : 'با خطا مواجه شد'} (currency=${currency}):`, fetchErr.message);
+        return res.status(504).json({
+          error: isTimeout
+            ? 'درگاه پرداخت پاسخ نداد (timeout). لطفاً دوباره تلاش کنید.'
+            : 'اتصال به درگاه پرداخت برقرار نشد. لطفاً دوباره تلاش کنید.',
+        });
+      }
       const rawText = await oxRes.text();
       let oxJson;
       try { oxJson = JSON.parse(rawText); } catch { oxJson = null; }
@@ -256,7 +299,7 @@ function initPaymentsModule({ app, pool, io, cron }) {
         if (Date.now() - last > 8000) {
           _liveCheckCache.set(trackId, Date.now());
           try {
-            const liveRes = await fetch(`${OXAPAY_API_BASE}/payment/${trackId}`, {
+            const liveRes = await fetchWithTimeout(`${OXAPAY_API_BASE}/payment/${trackId}`, {
               headers: { merchant_api_key: MERCHANT_API_KEY },
             });
             if (liveRes.ok) {
